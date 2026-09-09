@@ -9,6 +9,8 @@ import {
   updateQuote,
   getQuoteByNumber,
 } from '../repositories/dynamo.quote.repository';
+import { getClickUpTask } from './clickUpfetch.service';
+import { buildSteps, buildContentChangeSteps, QuoteStep } from './quoteTransition';
 
 const TENANT_ID = process.env.XERO_TENANT_ID!;
 const API_TOKEN = process.env.CLICKUP_API_TOKEN!;
@@ -95,6 +97,15 @@ function resolveJobCardBranch(quote: any): JobCardBranchKey {
   return isGlobal ? 'CRM050_GLOBAL' : 'CRM050_SERVICES';
 }
 
+// Returns whichever of the 4 job-card fields is populated for this quote, if any.
+// Only one branch is ever used per quote (see resolveJobCardBranch), so this is safe.
+export function getJobCardTaskId(quote: any): string | undefined {
+  for (const { dbField } of Object.values(JOB_CARD_BRANCHES)) {
+    if (quote[dbField]) return quote[dbField];
+  }
+  return undefined;
+}
+
 export async function pollQuotes() {
   try {
     const config = await getXeroConfig(TENANT_ID);
@@ -158,7 +169,6 @@ export async function pollQuotes() {
     }
     logger.info(`✅ Total Quotes  Retrieved: ${allQuotes.length}`);
     logger.info('Last Sync Used:', lastUpdatedDateUTC);
-    // console.log('Quote ',allQuotes);
     logger.info('--------------------------------------------');
 
     for (const quote of allQuotes) {
@@ -189,7 +199,6 @@ export async function pollQuotes() {
 export async function handleQuoteStatuses(quote: Quote) {
   const existingQuote = await getQuoteByNumber(quote.QuoteNumber);
 
-  let quoteAction = 'Created';
   const quoteIssueDate = quote.DateString
     ? new Date(quote.DateString).toISOString()
     : new Date().toISOString();
@@ -198,104 +207,11 @@ export async function handleQuoteStatuses(quote: Quote) {
     ? new Date(quote.ExpiryDateString).toISOString()
     : new Date().toISOString();
 
-  if (existingQuote) {
-    const lineItemsChanged =
-      JSON.stringify(existingQuote.lineItems) !== JSON.stringify(quote.LineItems);
-
-    const totalsChanged =
-      existingQuote.subTotal !== quote.SubTotal ||
-      existingQuote.taxTotal !== quote.TotalTax ||
-      existingQuote.quTotal !== quote.Total;
-
-    if (quote.Status !== existingQuote.quoteStatus) {
-      const prevStatus = existingQuote.quoteStatus;
-      logger.info(
-        `Quote ${quote.QuoteNumber} status change detected: ${prevStatus} -> ${quote.Status}`
-      );
-      switch (quote.Status) {
-        case 'SENT':
-          if (prevStatus === 'DECLINED') {
-            // Quote was in cold storage (CRM-33) and has now been sent again -
-            // move the thread back to CRM-02 instead of creating a new one.
-            quoteAction = 'Sent After Declined';
-          } else if (prevStatus === 'ACCEPTED') {
-            // Quote was already accepted and is now being sent again - per the
-            // diagram this is just a DB sync, no ClickUp action.
-            quoteAction = 'Accepted Quote Sent';
-          } else {
-            quoteAction = 'Sent';
-          }
-          break;
-        case 'ACCEPTED':
-          quoteAction = 'Accepted';
-          break;
-        case 'DELETED':
-          quoteAction = 'Deleted';
-          break;
-        case 'DECLINED':
-          quoteAction = 'Declined';
-          break;
-      }
-    } else if (lineItemsChanged || totalsChanged) {
-      // Xero's Status field stays ACCEPTED/DECLINED forever once reached - it never
-      // flips back to SENT just because the quote was resent. So a resend of an
-      // already-Accepted or already-Declined quote only ever shows up here, as a
-      // "something changed" fallback, not as a Status transition above.
-      if (existingQuote.quoteStatus === 'ACCEPTED') {
-        // Per diagram: DB-only sync, no ClickUp action.
-        quoteAction = 'Accepted Quote Sent';
-      } else if (existingQuote.quoteStatus === 'DECLINED') {
-        // Revive from cold storage: move CRM-33 thread back to CRM-02.
-        quoteAction = 'Sent After Declined';
-      } else {
-        quoteAction = existingQuote.quoteStatus === 'SENT' ? 'Revision After Sent' : 'Updated';
-      }
-    } else {
-      logger.info(`No changes for quote ${quote.QuoteNumber}`);
-      return;
-    }
-
-    const updates: any = {
-      quoteNumber: quote.QuoteNumber,
-      quoteReference: quote.Reference,
-      customerID: quote.Contact?.ContactID || '',
-      customerName: quote.Contact?.Name || '',
-      quoteIssueDate,
-      quoteExpireyDate,
-      quoteStatus: quote.Status,
-      currencyCode: quote.CurrencyCode,
-      lineItems: quote.LineItems,
-      subTotal: quote.SubTotal,
-      taxTotal: quote.TotalTax,
-      quTotal: quote.Total,
-      title: quote.Title,
-      invNumber: existingQuote.invNumber,
-      PoNumber: existingQuote.PoNumber,
-      quoteAction,
-      businessUnitvalueid: existingQuote.businessUnitvalueid,
-      businessUnitvalue: existingQuote.businessUnitvalue,
-      // Preserve existing task IDs
-      clickUpTaskidCrm1: existingQuote.clickUpTaskidCrm1,
-      clickUpTaskidCrm2: existingQuote.clickUpTaskidCrm2,
-      clickUpTaskidCrm5: existingQuote.clickUpTaskidCrm5,
-      clickUpTaskidCrm7: existingQuote.clickUpTaskidCrm7,
-      clickUpTaskidCrm9: existingQuote.clickUpTaskidCrm9,
-      clickUpTaskidCRM050_Global: existingQuote.clickUpTaskidCRM050_Global,
-      clickUpTaskidCRM050_SERVICES: existingQuote.clickUpTaskidCRM050_SERVICES,
-      clickUpTaskidCRM051_GLOBAL: existingQuote.clickUpTaskidCRM051_GLOBAL,
-      clickUpTaskidCRM051_SERVICES: existingQuote.clickUpTaskidCRM051_SERVICES,
-      clickUpTaskidCRM032: existingQuote.clickUpTaskidCRM032,
-      clickUpTaskidCRM033: existingQuote.clickUpTaskidCRM033,
-      quoteId: existingQuote.quoteId || quote.QuoteID,
-      createdAt: existingQuote.createdAt,
-    };
-
-    // Handle task creation/updates based on quote action
-    await handleQuoteTasks(updates, quoteAction);
-
-    await updateQuote(existingQuote.id, updates);
-  } else {
-    //  NEW QUOTE
+  // ─── "Does not exist": brand-new quote (no DB row) ────────────────────────
+  // Xero may already have moved it past DRAFT before our first poll ever saw
+  // it. Replay every step from 'Created' up to the current poll status so no
+  // ClickUp artifact is skipped.
+  if (!existingQuote) {
     const newItem: any = {
       id: `${Date.now()}-${Math.random().toString(36).substring(2, 8)}`,
       quoteId: quote.QuoteID,
@@ -332,17 +248,116 @@ export async function handleQuoteStatuses(quote: Quote) {
       updatedAt: new Date().toISOString(),
     };
 
-    // Handle task creation for new quote
-    await handleQuoteTasks(newItem, 'Created');
+    const steps = buildSteps(null, quote.Status || 'DRAFT');
+
+    // Sequential replay - later steps read task IDs that earlier steps stored
+    // on newItem. Deliberately a loop, not recursion.
+    for (const step of steps) {
+      await applyQuoteStep(newItem, step);
+    }
+
+    // quoteAction reflects the final state reached, not just 'Created'.
+    newItem.quoteAction = steps[steps.length - 1] ?? 'Created';
 
     await createQuote(newItem);
+    logger.info(`Quote ${quote.QuoteNumber} processed (new) with steps: ${steps.join(' -> ')}`);
+    return;
   }
 
-  logger.info(`Quote ${quote.QuoteNumber} processed with action: ${quoteAction}`);
+  // ─── Existing quote: compare DB status vs poll status, replay missing steps ──
+  const lineItemsChanged =
+    JSON.stringify(existingQuote.lineItems) !== JSON.stringify(quote.LineItems);
+
+  const totalsChanged =
+    existingQuote.subTotal !== quote.SubTotal ||
+    existingQuote.taxTotal !== quote.TotalTax ||
+    existingQuote.quTotal !== quote.Total;
+
+  let steps: QuoteStep[];
+
+  if (quote.Status !== existingQuote.quoteStatus) {
+    const prevStatus = existingQuote.quoteStatus;
+    logger.info(
+      `Quote ${quote.QuoteNumber} status change detected: ${prevStatus} -> ${quote.Status}`
+    );
+
+    steps = buildSteps(prevStatus, quote.Status);
+
+    if (steps.length === 0) {
+      // Unknown/unmodelled transition. Log loudly and leave the DB row
+      // untouched rather than throwing - one weird quote must not block the
+      // rest of the poll loop.
+      logger.warn(
+        `Quote ${quote.QuoteNumber}: unhandled transition ${prevStatus} -> ${quote.Status}. ` +
+          `DB row left unchanged. Add this pair to quoteTransition.ts if it is legitimate.`
+      );
+      return;
+    }
+  } else if (lineItemsChanged || totalsChanged) {
+    // Xero's Status field stays ACCEPTED/DECLINED forever once reached - it never
+    // flips back to SENT just because the quote was resent. So a resend of an
+    // already-Accepted or already-Declined quote only ever shows up here, as a
+    // "something changed" fallback, not as a Status transition above.
+    steps = buildContentChangeSteps(existingQuote.quoteStatus);
+  } else {
+    logger.info(`No changes for quote ${quote.QuoteNumber}`);
+    return;
+  }
+
+  const updates: any = {
+    quoteNumber: quote.QuoteNumber,
+    quoteReference: quote.Reference,
+    customerID: quote.Contact?.ContactID || '',
+    customerName: quote.Contact?.Name || '',
+    quoteIssueDate,
+    quoteExpireyDate,
+    quoteStatus: quote.Status,
+    currencyCode: quote.CurrencyCode,
+    lineItems: quote.LineItems,
+    subTotal: quote.SubTotal,
+    taxTotal: quote.TotalTax,
+    quTotal: quote.Total,
+    title: quote.Title,
+    invNumber: existingQuote.invNumber,
+    PoNumber: existingQuote.PoNumber,
+    quoteAction: steps[steps.length - 1],
+    businessUnitvalueid: existingQuote.businessUnitvalueid,
+    businessUnitvalue: existingQuote.businessUnitvalue,
+    // Preserve existing task IDs
+    clickUpTaskidCrm1: existingQuote.clickUpTaskidCrm1,
+    clickUpTaskidCrm2: existingQuote.clickUpTaskidCrm2,
+    clickUpTaskidCrm5: existingQuote.clickUpTaskidCrm5,
+    clickUpTaskidCrm7: existingQuote.clickUpTaskidCrm7,
+    clickUpTaskidCrm9: existingQuote.clickUpTaskidCrm9,
+    clickUpTaskidCRM050_Global: existingQuote.clickUpTaskidCRM050_Global,
+    clickUpTaskidCRM050_SERVICES: existingQuote.clickUpTaskidCRM050_SERVICES,
+    clickUpTaskidCRM051_GLOBAL: existingQuote.clickUpTaskidCRM051_GLOBAL,
+    clickUpTaskidCRM051_SERVICES: existingQuote.clickUpTaskidCRM051_SERVICES,
+    clickUpTaskidCRM032: existingQuote.clickUpTaskidCRM032,
+    clickUpTaskidCRM033: existingQuote.clickUpTaskidCRM033,
+    quoteId: existingQuote.quoteId || quote.QuoteID,
+    createdAt: existingQuote.createdAt,
+  };
+
+  // Sequential replay of every missed step. Each applyQuoteStep call guards on
+  // the task IDs stored on `updates`, so replaying an already-applied step is
+  // a no-op - this is what makes multi-hop jumps safe, and single-step polls
+  // behave exactly as before (a 1-step path is just a 1-element list).
+  for (const step of steps) {
+    await applyQuoteStep(updates, step);
+  }
+
+  await updateQuote(existingQuote.id, updates);
+  logger.info(`Quote ${quote.QuoteNumber} processed with steps: ${steps.join(' -> ')}`);
 }
 
-async function handleQuoteTasks(quote: any, action: string) {
-  switch (action) {
+/**
+ * Applies one step to the quote's ClickUp footprint. Each case is idempotent:
+ * it checks whether its artifact already exists (via the task IDs stored on
+ * `quote`) before creating anything, so steps can safely be re-run or replayed.
+ */
+export async function applyQuoteStep(quote: any, step: QuoteStep) {
+  switch (step) {
     case 'Created':
       // Create task in CRM 1 only
       if (!quote.clickUpTaskidCrm1) {
@@ -354,21 +369,20 @@ async function handleQuoteTasks(quote: any, action: string) {
       break;
 
     case 'Sent':
-      // Create task in CRM 2
+      // Create task in CRM 2 if we don't have one yet
       if (!quote.clickUpTaskidCrm2) {
         const taskCrm2 = await createClickUpTaskForCRM('CRM2', 'Sent', quote);
         if (taskCrm2) {
-          quote.clickUpTaskidCrm2 = taskCrm2.id; // <-- now the ID is stored
+          quote.clickUpTaskidCrm2 = taskCrm2.id;
         }
       }
 
       // Mark CRM 1 task with the status from buildClickUpPayload
       if (quote.clickUpTaskidCrm1) {
-        const { status } = await buildClickUpPayload(action, quote, 'CRM1');
+        const { status } = await buildClickUpPayload('Sent', quote, 'CRM1');
         await updateClickUpTaskStatus(quote.clickUpTaskidCrm1, status);
         await addClickUpComment(quote.clickUpTaskidCrm1, 'Quote updated and sent');
 
-        // ✅ ADD THE LINK HERE (after the CRM‑02 ID is available)
         if (quote.clickUpTaskidCrm2) {
           await addClickUpComment(
             quote.clickUpTaskidCrm1,
@@ -377,14 +391,14 @@ async function handleQuoteTasks(quote: any, action: string) {
         }
 
         // Update CRM‑01 description with the link (handled by buildClickUpPayload)
-        await updateClickUpTask(quote.clickUpTaskidCrm1, quote, action, 'CRM1');
+        await updateClickUpTask(quote.clickUpTaskidCrm1, quote, 'Sent', 'CRM1');
       }
       break;
 
     case 'Revision After Sent':
-      // Update existing quote in CRM 2 (pass CRM2 to updateClickUpTask)
+      // Update existing quote in CRM 2
       if (quote.clickUpTaskidCrm2) {
-        const taskid = await updateClickUpTask(quote.clickUpTaskidCrm2, quote, action, 'CRM2');
+        const taskid = await updateClickUpTask(quote.clickUpTaskidCrm2, quote, step, 'CRM2');
         if (taskid) {
           await addClickUpComment(taskid, 'Quote Revised');
         }
@@ -392,28 +406,62 @@ async function handleQuoteTasks(quote: any, action: string) {
       break;
 
     case 'Accepted':
-      // Update CRM-02 task, then mark its thread complete right away (per diagram).
+      // Defensive: a quote can reach 'Accepted' via replay without CRM-02 ever
+      // existing (e.g. legacy DB row, or a missed 'Sent'). Create it first so
+      // the rest of this step has a thread to comment on and link from.
+      if (!quote.clickUpTaskidCrm2) {
+        logger.warn(
+          `Quote ${quote.quoteNumber}: 'Accepted' step reached without a CRM-02 task. Creating one now.`
+        );
+        const taskCrm2 = await createClickUpTaskForCRM('CRM2', 'Sent', quote);
+        if (taskCrm2) {
+          quote.clickUpTaskidCrm2 = taskCrm2.id;
+        }
+      }
+
+      // Update CRM-02 task first (per diagram), but don't close it out yet - we need the
+      // job card's id before we can post the "moved to job card" comment on CRM-02.
       if (quote.clickUpTaskidCrm2) {
-        await updateClickUpTask(quote.clickUpTaskidCrm2, quote, action, 'CRM2');
-        await updateClickUpTaskStatus(quote.clickUpTaskidCrm2, 'complete');
+        await updateClickUpTask(quote.clickUpTaskidCrm2, quote, step, 'CRM2');
       }
 
       // Create the job card (one of CRM-050/051 x Global/Services) if not already created.
-      // Replaces the old always-create CRM5 task.
       const branchKey = resolveJobCardBranch(quote);
       const branch = JOB_CARD_BRANCHES[branchKey];
-      if (!quote[branch.dbField]) {
+
+      let jobCardTaskId = quote[branch.dbField];
+      if (!jobCardTaskId) {
         const taskJobCard = await createClickUpTaskForCRM(branchKey, 'Accepted', quote);
         if (taskJobCard) {
-          quote[branch.dbField] = taskJobCard.id;
+          jobCardTaskId = taskJobCard.id;
+          quote[branch.dbField] = jobCardTaskId;
+
+          // Carry over any PO PDF the user already attached on CRM-02 (per the businessUnit
+          // webhook, which is where PO No/PDF are now captured) to the new job card.
+          if (quote.clickUpTaskidCrm2) {
+            await copyAttachments(quote.clickUpTaskidCrm2, jobCardTaskId);
+          }
         }
+      }
+
+      // Per Rev 1.3: post a "moved to job card" comment on CRM-02 before closing its thread.
+      const crmLabel = branchKey.replace('_', '-'); // e.g. CRM050-GLOBAL, CRM051-SERVICES
+
+      if (quote.clickUpTaskidCrm2 && jobCardTaskId) {
+        await addClickUpComment(
+          quote.clickUpTaskidCrm2,
+          `Task moved to ${crmLabel}\nhttps://app.clickup.com/t/${jobCardTaskId}`
+        );
+      }
+      if (quote.clickUpTaskidCrm2) {
+        await updateClickUpTaskStatus(quote.clickUpTaskidCrm2, 'complete');
       }
       break;
 
     case 'Updated':
-      // Update CRM 1 task (pass CRM1 to updateClickUpTask)
+      // Update CRM 1 task
       if (quote.clickUpTaskidCrm1) {
-        const taskid = await updateClickUpTask(quote.clickUpTaskidCrm1, quote, action, 'CRM1');
+        const taskid = await updateClickUpTask(quote.clickUpTaskidCrm1, quote, step, 'CRM1');
         if (taskid) {
           await addClickUpComment(taskid, 'Quote Updated');
         }
@@ -464,39 +512,45 @@ async function handleQuoteTasks(quote: any, action: string) {
       // CRM-02 instead of creating a brand new CRM-02 task, and post the "moved"
       // comment on BOTH sides of the move (CRM-02 says where it came from, CRM-33
       // says where it went), then close out CRM-33 and reopen CRM-02.
-      if (quote.clickUpTaskidCrm2) {
-        // updateClickUpTask always sets CRM-02 back to 'to do' for this crm ('Mark
-        // CRM-02 Thread as Todo' in the diagram), so no separate status call needed.
-        await updateClickUpTask(quote.clickUpTaskidCrm2, quote, action, 'CRM2');
+      //
+      // Guards: both CRM-02 and CRM-33 must already exist. If either is missing
+      // (partially-synced legacy row) there's nothing meaningful to move - log it.
+      if (!quote.clickUpTaskidCrm2 || !quote.clickUpTaskidCRM033) {
+        logger.warn(
+          `Quote ${quote.quoteNumber}: 'Sent After Declined' needs CRM-02 and CRM-33, ` +
+            `got crm2=${!!quote.clickUpTaskidCrm2} crm33=${!!quote.clickUpTaskidCRM033}. Skipping move.`
+        );
+        break;
+      }
 
-        if (quote.clickUpTaskidCRM033) {
-          await addClickUpComment(
-            quote.clickUpTaskidCrm2,
-            `Task moved from CRM-33\nhttps://app.clickup.com/t/${quote.clickUpTaskidCRM033}`
-          );
-        }
-      }
-      if (quote.clickUpTaskidCRM033) {
-        if (quote.clickUpTaskidCrm2) {
-          await addClickUpComment(
-            quote.clickUpTaskidCRM033,
-            `Task moved to CRM-02\nhttps://app.clickup.com/t/${quote.clickUpTaskidCrm2}`
-          );
-        }
-        await updateClickUpTaskStatus(quote.clickUpTaskidCRM033, 'complete');
-      }
+      // updateClickUpTask always sets CRM-02 back to 'to do' for this crm ('Mark
+      // CRM-02 Thread as Todo' in the diagram), so no separate status call needed.
+      await updateClickUpTask(quote.clickUpTaskidCrm2, quote, step, 'CRM2');
+
+      await addClickUpComment(
+        quote.clickUpTaskidCrm2,
+        `Task moved from CRM-33\nhttps://app.clickup.com/t/${quote.clickUpTaskidCRM033}`
+      );
+
+      await addClickUpComment(
+        quote.clickUpTaskidCRM033,
+        `Task moved to CRM-02\nhttps://app.clickup.com/t/${quote.clickUpTaskidCrm2}`
+      );
+
+      await updateClickUpTaskStatus(quote.clickUpTaskidCRM033, 'complete');
       break;
 
     case 'Accepted Quote Sent':
-      // Quote was already Accepted and is now being sent again. Per the diagram this
+      // Quote was already Accepted and is being sent again. Per the diagram this
       // is a dead end - no ClickUp task changes, just sync the DB record (handled
-      // automatically by updateQuote() after this function returns).
+      // automatically by updateQuote() after the replay loop).
       logger.info(
         `Quote ${quote.quoteNumber} re-sent after Accepted - DB synced, no ClickUp changes made.`
       );
       break;
   }
 }
+
 async function createClickUpTaskForCRM(crm: string, action: string, quote: any): Promise<any> {
   const { topic, listid, description, status, customFields, comment, due_date, quoteUrl } =
     await buildClickUpPayload(action, quote, crm);
@@ -538,7 +592,15 @@ export async function updateClickUpTaskStatus(taskId: string, status: string) {
 }
 
 export async function buildClickUpPayload(action: string, quote: any, crm: string = 'CRM1') {
-  let topic = `${quote.quoteNumber} ,${quote.customerName} ,${quote.title}`;
+  // Per Rev 1.3: job card Name includes the PO No (Qu No, PO No, Customer, Quote Title).
+  // CRM-01/02/33/32 keep the original 3-part name. If there's no PO yet, just drop that
+  // segment rather than stuffing a fake "No PO" placeholder into every job card title.
+  const topic =
+    crm in JOB_CARD_BRANCHES
+      ? [quote.quoteNumber, quote.PoNumber || null, quote.customerName, quote.title]
+          .filter(Boolean)
+          .join(' ,')
+      : `${quote.quoteNumber} ,${quote.customerName} ,${quote.title}`;
 
   const { listid, status, description, customFields, comment, due_date, quoteUrl } =
     await constructClickUpPayload(action, quote, crm);
@@ -570,10 +632,6 @@ async function constructClickUpPayload(
   // Build quote items (used by some cases)
   const quoteItemsCrm = (quote.lineItems || [])
     .map((item: any, index: number) => {
-      const taxRate =
-        item.LineAmount && item.LineAmount !== 0
-          ? ((item.TaxAmount / item.LineAmount) * 100).toFixed(2)
-          : '0.00';
       return `Item ${index + 1}:
     - Item Description: ${item.Description}
     - Item Quantity: ${item.Quantity}`;
@@ -606,20 +664,11 @@ Quote Total: ${quote.quTotal}
 
   const viewOrEdit = quote.quoteStatus === 'DRAFT' ? 'edit' : 'view';
   const quoteUrl = `${Xero_Url}${viewOrEdit}/${quote.quoteId}`;
-  const relatedTasksSection = getRelatedTasksSection(quote, crm);
 
   let description = '';
   let comment = '';
   let due_date = 0;
   let customFields: any[] = [];
-
-  let chatId: string;
-
-  if (process.env.NODE_ENV === 'development') {
-    chatId = process.env.chartIDTest || '';
-  } else {
-    chatId = '';
-  }
 
   if (crm === 'CRM1') {
     listid = process.env.CRM1_LIST_ID!;
@@ -633,7 +682,7 @@ Quote Total: ${quote.quTotal}
     const baseDescription = `${relatedSection}
 Description:
 Scope of Work - ${quote.title}
-Quote Status - ${quote.quoteStatus}
+Quote Status - DRAFT
 Quote Expiry - ${quote.quoteExpireyDate}
 
 Quote Link - ${quoteUrl}
@@ -663,10 +712,10 @@ ${totalsText}
       { id: CUSTOMER_FIELD_ID, value: quote.customerName },
       taskLinkField(CRM01_LINK_FIELD_ID, quote.clickUpTaskidCrm1),
     ].filter(Boolean) as any[];
-    description = `${relatedTasksSection}
+    description = `
 Description:
 Scope of Work - ${quote.title}
-Quote Status - ${quote.quoteStatus}
+Quote Status - SENT
 Quote Expiry - ${quote.quoteExpireyDate}
 
 Quote Link - ${quoteUrl}
@@ -689,17 +738,8 @@ ${totalsText}
       taskLinkField(CRM01_LINK_FIELD_ID, quote.clickUpTaskidCrm1),
       taskLinkField(CRM02_LINK_FIELD_ID, quote.clickUpTaskidCrm2),
     ].filter(Boolean) as any[];
-    description = `${relatedTasksSection}
+    description = `
 Description:
-Scope of Work - ${quote.title}
-Quote Link - ${quoteUrl}
-
-Quote Items:
-${quoteItemsCrm}
-`;
-
-    //message for telegram
-    const telegrammsg = `Name: ${quote.title}
 Scope of Work - ${quote.title}
 Quote Link - ${quoteUrl}
 
@@ -717,10 +757,10 @@ ${quoteItemsCrm}
       taskLinkField(CRM01_LINK_FIELD_ID, quote.clickUpTaskidCrm1),
       taskLinkField(CRM02_LINK_FIELD_ID, quote.clickUpTaskidCrm2),
     ].filter(Boolean) as any[];
-    description = `${relatedTasksSection}
+    description = `
 Description:
 Scope of Work - ${quote.title}
-Quote Status - ${quote.quoteStatus}
+Quote Status - DECLINED
 Quote Expiry - ${quote.quoteExpireyDate}
 
 Quote Link - ${quoteUrl}
@@ -743,7 +783,7 @@ ${totalsText}
       taskLinkField(CRM02_LINK_FIELD_ID, quote.clickUpTaskidCrm2),
       taskLinkField(CRM33_LINK_FIELD_ID, quote.clickUpTaskidCRM033),
     ].filter(Boolean) as any[];
-    description = `${relatedTasksSection}
+    description = `
 Description:
 Scope of Work - ${quote.title}
 Quote Link - ${quoteUrl}
@@ -786,6 +826,7 @@ async function updateClickUpTask(taskId: string, quote: any, action: string, crm
   logger.info(`Updated ClickUp task ${taskId}`);
   return taskId;
 }
+
 async function createClickUpTask(
   description: string,
   topic: string,
@@ -867,6 +908,25 @@ export async function addClickUpComment(taskId: string, commentText: string) {
   if (!res.ok) console.error('Comment failed:', await res.text());
 }
 
+// Copies every attachment on sourceTaskId over to targetTaskId, skipping any whose URL is
+// already present on the target (so this is safe to call more than once for the same pair).
+export async function copyAttachments(sourceTaskId: string, targetTaskId: string): Promise<number> {
+  const sourceTask = await getClickUpTask(sourceTaskId);
+  if (!sourceTask.attachments || !sourceTask.attachments.length) return 0;
+
+  const targetTask = await getClickUpTask(targetTaskId);
+  const existingUrls = new Set((targetTask.attachments || []).map((att: any) => att.url));
+
+  let copied = 0;
+  for (const file of sourceTask.attachments) {
+    if (!existingUrls.has(file.url)) {
+      await uploadAttachmentToClickUpTask(targetTaskId, file.url);
+      copied++;
+    }
+  }
+  return copied;
+}
+
 export async function uploadAttachmentToClickUpTask(taskId: string, fileUrl: string) {
   if (!API_TOKEN) throw new Error('ClickUp token not set');
 
@@ -878,7 +938,7 @@ export async function uploadAttachmentToClickUpTask(taskId: string, fileUrl: str
   const arrayBuffer = await fileResponse.arrayBuffer(); // No deprecation
   const buffer = Buffer.from(arrayBuffer);
 
-  const filename = fileUrl.split('/').pop() || 'attachment';
+  const filename = decodeURIComponent(fileUrl.split('/').pop() || 'attachment');
 
   const formData = new FormData();
   formData.append('attachment', buffer, filename);

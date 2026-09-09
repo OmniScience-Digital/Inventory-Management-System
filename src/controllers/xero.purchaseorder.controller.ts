@@ -6,6 +6,7 @@ import {
   extractQuoteName,
   updateClickUpTaskStatus,
   uploadAttachmentToClickUpTask,
+  getJobCardTaskId,
 } from '../services/xero.quote.service';
 import { getInvByXeroInvoiceNumber, updateInvoice } from '../repositories/xero.invoice.repository';
 import { ClickUpTaskResponse } from '../schema/xero.schema';
@@ -66,7 +67,7 @@ export const xeroPOController = {
         quoteAction: existingQuote.quoteAction,
         title: existingQuote.title,
         invNumber: existingQuote.invNumber,
-        PoNumber: poNumber || existingQuote.purchaseOrderNumber || null,
+        PoNumber: poNumber || existingQuote.PoNumber || null,
         clickUpTaskidCrm1: existingQuote.clickUpTaskidCrm1,
         clickUpTaskidCrm2: existingQuote.clickUpTaskidCrm2,
         clickUpTaskidCrm5: existingQuote.clickUpTaskidCrm5,
@@ -87,21 +88,26 @@ export const xeroPOController = {
         });
       }
 
-      // Copy PO files to CRM5 and CRM7 (dedup by URL)
-      for (const targetTaskId of [
-        existingQuote.clickUpTaskidCrm5,
-        existingQuote.clickUpTaskidCrm7,
-      ]) {
-        if (!targetTaskId) continue;
-
-        const targetTask = await getClickUpTask(targetTaskId);
+      // Copy PO files to whichever job card (CRM-050/051 x Global/Services) this quote
+      // actually has - clickUpTaskidCrm5/Crm7 are the old, now-unused single job-card list
+      // and are never populated for quotes going through the current 4-way split.
+      const jobCardTaskId = getJobCardTaskId(existingQuote);
+      if (jobCardTaskId) {
+        const targetTask = await getClickUpTask(jobCardTaskId);
         const existingUrls = new Set((targetTask.attachments || []).map((att: any) => att.url));
 
         for (const file of task.attachments) {
           if (!existingUrls.has(file.url)) {
-            await uploadAttachmentToClickUpTask(targetTaskId, file.url);
+            await uploadAttachmentToClickUpTask(jobCardTaskId, file.url);
           }
         }
+      } else {
+        // Quote hasn't been Accepted yet (no job card exists) - the businessUnit webhook's
+        // copy-on-Accept step (see xero.quote.service.ts) will carry these attachments over
+        // once the job card is created, so this isn't an error, just a no-op for now.
+        logger.info(
+          `poUpdate: no job card exists yet for quote ${quoteName} - skipping attachment copy`
+        );
       }
 
       // Mark CRM2 as complete
@@ -266,7 +272,7 @@ function parseInspectionClickUpPayload(clickupPayload: any): string {
 }
 
 //2. Extract Purchase Order Number from custom fields
-function extractPurchaseOrderNumber(task: any): string | null {
+export function extractPurchaseOrderNumber(task: any): string | null {
   const t = task.task || task;
   const customFields = t.custom_fields || [];
   const poField = customFields.find(

@@ -1,7 +1,8 @@
 import { Request, Response } from 'express';
 import { getClickUpTask, updateClickUpBusinessUnit } from '../services/clickUpfetch.service';
 import { getQuoteByNumber, updateQuote } from '../repositories/dynamo.quote.repository';
-import { extractQuoteName } from '../services/xero.quote.service';
+import { extractQuoteName, addClickUpComment } from '../services/xero.quote.service';
+import { extractPurchaseOrderNumber } from './xero.purchaseorder.controller';
 
 export const businessUnit_FIELD_ID = 'fdf29394-d070-4384-863c-9f2f5885061f';
 // Allowed Business Unit option IDs from ClickUp
@@ -26,6 +27,11 @@ export const xeroBusinessUnitController = {
       if (businessUnit) {
         await updateClickUpBusinessUnit(taskId, businessUnit.valueId);
       }
+
+      // Per Rev 1.3: PO No is now captured on this same task/webhook, alongside Business
+      // Unit, before the job card is ever created - fixes job card branch selection
+      // (PO = #INTPO?) running against an empty PoNumber.
+      const poNumber = extractPurchaseOrderNumber(task);
 
       // Extract Quote Name from text_content or description
       const quoteName = extractQuoteName(task) as string;
@@ -61,6 +67,8 @@ export const xeroBusinessUnitController = {
         // Set business unit fields from extracted data
         businessUnitvalueid: businessUnit?.valueId || existingQuote.businessUnitvalueid,
         businessUnitvalue: businessUnit?.name || existingQuote.businessUnitvalue,
+        // PO No captured here now too (see comment above)
+        PoNumber: poNumber || existingQuote.PoNumber || '',
         // Preserve ClickUp task IDs
         clickUpTaskidCrm1: existingQuote.clickUpTaskidCrm1,
         clickUpTaskidCrm2: existingQuote.clickUpTaskidCrm2,
@@ -73,9 +81,18 @@ export const xeroBusinessUnitController = {
 
       const quoteUpdate = await updateQuote(existingQuote.id, updates);
 
+      // Per Rev 1.3: confirm both allocations back on the task as comments.
+      if (poNumber) {
+        await addClickUpComment(taskId, `Purchase order : ${poNumber} Allocated`);
+      }
+      if (businessUnit) {
+        await addClickUpComment(taskId, `Business Unit : ${businessUnit.name} Allocated`);
+      }
+
       return res.status(200).json({
         success: true,
         businessUnit,
+        poNumber,
         quoteName,
       });
     } catch (error: any) {
@@ -90,8 +107,6 @@ export const xeroBusinessUnitController = {
 
 // Parse task ID from webhook payload
 function parseInspectionClickUpPayload(clickupPayload: any): string {
-  console.log('CLICKUP WEBHOOK BODY:', JSON.stringify(clickupPayload, null, 2));
-
   return clickupPayload?.payload?.id || clickupPayload?.id;
 }
 
