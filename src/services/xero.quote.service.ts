@@ -78,14 +78,16 @@ type JobCardBranchKey = keyof typeof JOB_CARD_BRANCHES;
  * Picks which of the 4 job-card branches (and therefore which DB field / ClickUp list)
  * a new job card should use.
  *
- * NOTE: at the moment a quote is Accepted, quote.PoNumber is normally still empty -
- * it only gets filled in later, once sales manually enters it on CRM-02 (see
- * xero.purchaseorder.controller.ts / poUpdate). Until that's resolved with Shaughn,
- * an empty PO number will fall through to the "not internal" (CRM-050) branch below.
+ * Per the confirmed "new Accepted flow" diagram:
+ *   - PO No is blank        -> CRM-051 (internal)
+ *   - PO No starts "#INTPO" -> CRM-051 (internal)
+ *   - PO No present and NOT "#INTPO" -> CRM-050 (external)
+ * Then split again by Business Unit (Global / Services).
  */
 function resolveJobCardBranch(quote: any): JobCardBranchKey {
   const poNumber = (quote?.PoNumber || '').toString().trim().toUpperCase();
-  const isInternalPO = poNumber.startsWith(INTERNAL_PO_PREFIX);
+  const isBlank = poNumber === '';
+  const isInternalPO = isBlank || poNumber.startsWith(INTERNAL_PO_PREFIX);
 
   // Business Unit is set via xeroBusinessUnitController, which always resolves to
   // Global or Services (defaulting to Services) - so we compare by ID, not name.
@@ -475,6 +477,11 @@ export async function applyQuoteStep(quote: any, step: QuoteStep) {
         if (taskCrm33) {
           quote.clickUpTaskidCRM033 = taskCrm33.id;
         }
+      } else {
+        // Repeat decline: CRM-33 already exists from a prior decline, but if the
+        // quote was revived in between ('Sent After Declined' marks it complete),
+        // it's sitting closed. Reopen it - it's declined again.
+        await updateClickUpTaskStatus(quote.clickUpTaskidCRM033, 'to do');
       }
 
       // Move the CRM-02 thread over to CRM-33 and mark it complete.
