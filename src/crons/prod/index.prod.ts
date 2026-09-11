@@ -3,13 +3,17 @@ import cron from 'node-cron';
 import { getFleetvehicles } from '../../helper/fleet/fleet.helper';
 import { getFleetTasks } from '../../helper/task/task.helper';
 import { FleetController } from '../../controllers/cron.fleetController';
+import { addQuoteJob } from '../../queues/quotes.queue';
 
 logger.info('Prod Cron Loaded');
 
 // Set the time zone to Johannesburg, South Africa (SAST)
 const timeZone = 'Africa/Johannesburg';
 
-logger.info;
+(async () => {
+  logger.info('🕒 Starting Prod Quote cron...');
+  await addQuoteJob();
+})();
 
 //Task 1am cron
 
